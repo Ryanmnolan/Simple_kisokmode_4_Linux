@@ -130,6 +130,9 @@ After about a minute, the screen shows the **"Kiosk is ready"** page with the se
 
 > The first start of Chromium can take 20–60 seconds. A black screen with a cursor, or a white screen, during that time is normal.
 
+<img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081902_Chrome.jpg" alt="Kiosk Ready Examples" width="400">
+
+
 ### Step 5: Open the settings page
 
 From a phone or computer **on the same network**, open:
