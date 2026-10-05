@@ -179,6 +179,9 @@ After this many minutes with no touches, the kiosk reloads the home page. Set it
 | **Hide mouse pointer** | On by default. Takes effect after a reboot. |
 | **Graphics compatibility mode** | On by default. Fixes a blank white screen on some Pi setups. Turn it off only if video or animations look choppy. |
 
+<img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081831_Chrome.jpg" alt="Kiosk screen position" width="400">
+
+
 ### Screen on/off schedule
 
 | Setting | What it does |
@@ -191,6 +194,9 @@ After this many minutes with no touches, the kiosk reloads the home page. Set it
 | **Screen on / Screen off / Follow schedule** | Manual control right now. A manual change lasts until the next scheduled change. |
 
 The schedule turns off only the **screen**. The computer keeps running, so it is ready instantly. Touching the screen during off hours does not wake it; use the **Screen on** button.
+
+<img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081837_Chrome.jpg" alt="Kiosk screen on and off timer" width="400">
+
 
 ### Privacy
 
@@ -205,6 +211,9 @@ The schedule turns off only the **screen**. The computer keeps running, so it is
 
 The button at the bottom reloads the home page on the kiosk immediately.
 
+<img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081841_Chrome.jpg" alt="Kiosk bottom options" width="400">
+
+ 
 ---
 
 ## Adding your own pages
