@@ -162,6 +162,9 @@ Choose what the kiosk shows:
 - **Web address:** any `http://` or `https://` address (dashboards, websites, Node-RED, Home Assistant, etc.)
 - **Page on the kiosk:** a page stored on the kiosk itself, which works without internet. See [Adding your own pages](#adding-your-own-pages).
 
+<img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081926_Chrome.jpg" alt="Kiosk  Home Page Settings" width="400">
+
+
 ### Return to home page when idle
 
 After this many minutes with no touches, the kiosk reloads the home page. Set it to `0` to turn this off. It only reloads if someone actually used the screen, so a dashboard is not reloaded for nothing.
