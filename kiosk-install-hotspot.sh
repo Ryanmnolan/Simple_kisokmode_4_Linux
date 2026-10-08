@@ -28,6 +28,9 @@
 #              Ctrl+Alt+F2 text login (Ctrl+Alt+F1 returns)
 #        - "Go home now", "Screen on/off", "Reboot" and "Shut down" buttons
 #
+#  Debian mini PCs: Wi-Fi set up by the Debian installer is fixed so it
+#  reconnects at every boot (wpasupplicant is installed for it).
+#
 #  Install:
 #    1. Flash the OS, create your user, enable SSH, connect to the network.
 #    2. Copy this file to the machine, then run:   sudo bash kiosk-install.sh
@@ -107,6 +110,198 @@ install -d -o "$KIOSK_USER" -g "$KIOSK_GROUP" -m 755 /etc/kiosk
 install -d -o "$KIOSK_USER" -g "$KIOSK_GROUP" "$PAGES_DIR" "$STATE_DIR"
 install -d -o "$KIOSK_USER" -g "$KIOSK_GROUP" "$KIOSK_HOME/.config" "$KIOSK_HOME/.config/labwc"
 install -d /opt/kiosk
+
+# ---------- Debian Wi-Fi: make it reconnect at every boot ---------------------
+# The Debian installer sets up Wi-Fi in /etc/network/interfaces, sometimes with
+# tools that are not installed afterwards, so the Wi-Fi is lost after a reboot.
+cat > /opt/kiosk/netcfg.py <<'NETEOF'
+#!/usr/bin/env python3
+"""Find and fix Wi-Fi set up by the Debian installer in /etc/network/interfaces.
+
+  netcfg.py check        -> JSON describing the Wi-Fi stanza ({} if none)
+  netcfg.py fix-ifupdown -> make it reliable: wpa_supplicant + 'auto' at boot
+  netcfg.py comment-out  -> disable the stanza (Wi-Fi moved to NetworkManager)
+"""
+import json
+import os
+import re
+import shutil
+import sys
+
+P = os.environ.get("KIOSK_IFACES", "/etc/network/interfaces")
+SYS = os.environ.get("KIOSK_SYSNET", "/sys/class/net")
+BACKUP = P + ".kiosk-backup"
+STANZA_START = ("iface", "auto", "allow-", "source", "mapping", "rename",
+                "no-auto-down", "no-scripts")
+
+
+def unquote(v):
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
+def wifi_ifaces():
+    try:
+        return {n for n in os.listdir(SYS) if os.path.isdir(os.path.join(SYS, n, "wireless"))}
+    except OSError:
+        return set()
+
+
+def load():
+    with open(P) as f:
+        lines = f.read().split("\n")
+    wifi = wifi_ifaces()
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*iface\s+(\S+)\s+inet\s+(\S+)", line)
+        if not m or m.group(1) not in wifi:
+            continue
+        end = i + 1
+        while end < len(lines):
+            s = lines[end].strip()
+            if s and not s.startswith("#") and s.split()[0].startswith(STANZA_START):
+                break
+            end += 1
+        opts = {}
+        for l in lines[i + 1:end]:
+            s = l.strip()
+            if s and not s.startswith("#"):
+                k, _, v = s.partition(" ")
+                opts[k] = v.strip()
+        return lines, i, end, m.group(1), opts
+    return lines, None, None, None, {}
+
+
+def info():
+    lines, start, end, iface, opts = load()
+    if start is None:
+        return {}
+    has_wpa = any(k.startswith("wpa-") for k in opts)
+    return {
+        "iface": iface,
+        "ssid": unquote(opts.get("wpa-ssid") or opts.get("wireless-essid")),
+        "psk": unquote(opts.get("wpa-psk")),
+        "open": "wireless-essid" in opts and not has_wpa and "wireless-key" not in opts,
+        "has_wpa": has_wpa,
+        "wep": "wireless-key" in opts,
+        "wpa_conf": "wpa-conf" in opts,
+    }
+
+
+def backup():
+    if not os.path.exists(BACKUP):
+        shutil.copy2(P, BACKUP)
+
+
+def write(lines):
+    tmp = P + ".kiosk-tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines))
+    shutil.copymode(P, tmp)
+    os.replace(tmp, P)
+
+
+def fix_ifupdown():
+    lines, start, end, iface, opts = load()
+    if start is None:
+        return "no Wi-Fi stanza"
+    d = info()
+    backup()
+    changed = []
+    block = lines[start + 1:end]
+    if d["open"] and d["ssid"]:
+        # Open network set up with wireless-tools: switch to wpa_supplicant,
+        # which keeps retrying if the network is not there at boot.
+        keep = [l for l in block
+                if not l.strip().startswith("wireless-")
+                and not l.strip().startswith("# wireless-*")]
+        while keep and not keep[-1].strip():
+            keep.pop()
+        keep += ["    wpa-ssid " + d["ssid"], "    wpa-key-mgmt NONE", ""]
+        block = keep
+        changed.append("open network now uses wpa_supplicant")
+    lines = lines[:start + 1] + block + lines[end:]
+    # Bring the Wi-Fi up as part of startup, not only when the card appears
+    out, has_auto = [], False
+    for l in lines:
+        s = l.split()
+        if len(s) >= 2 and s[0] == "allow-hotplug" and iface in s[1:]:
+            rest = [x for x in s[1:] if x != iface]
+            if rest:
+                out.append("allow-hotplug " + " ".join(rest))
+            out.append("auto " + iface)
+            has_auto = True
+            changed.append("allow-hotplug -> auto")
+            continue
+        if len(s) >= 2 and s[0] == "auto" and iface in s[1:]:
+            has_auto = True
+        out.append(l)
+    if not has_auto:
+        idx = next(i for i, l in enumerate(out)
+                   if re.match(r"\s*iface\s+%s\s" % re.escape(iface), l))
+        out.insert(idx, "auto " + iface)
+        changed.append("added auto")
+    write(out)
+    return ", ".join(changed) or "already fine"
+
+
+def comment_out():
+    lines, start, end, iface, opts = load()
+    if start is None:
+        return "no Wi-Fi stanza"
+    backup()
+    tag = "# kiosk: Wi-Fi moved to NetworkManager # "
+    out = []
+    for i, l in enumerate(lines):
+        s = l.split()
+        mine = start <= i < end and l.strip() != ""
+        hdr = len(s) >= 2 and s[0] in ("auto", "allow-hotplug") and s[1:] == [iface]
+        out.append(tag + l if (mine or hdr) else l)
+    write(out)
+    return "Wi-Fi stanza disabled"
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "check"
+    if not os.path.exists(P):
+        print("{}" if cmd == "check" else "no interfaces file")
+        sys.exit(0)
+    if cmd == "check":
+        print(json.dumps(info()))
+    elif cmd == "fix-ifupdown":
+        print(fix_ifupdown())
+    elif cmd == "comment-out":
+        print(comment_out())
+    else:
+        sys.exit("unknown command")
+NETEOF
+chmod 755 /opt/kiosk/netcfg.py
+WIFI_INFO="$(python3 /opt/kiosk/netcfg.py check 2>/dev/null || echo '{}')"
+wifi_get(){ python3 -c 'import json,sys; v=json.loads(sys.argv[1]).get(sys.argv[2]); print("" if v is None else v)' "$WIFI_INFO" "$1"; }
+if [[ -n "$WIFI_INFO" && "$WIFI_INFO" != "{}" ]]; then
+  W_IF="$(wifi_get iface)"; W_SSID="$(wifi_get ssid)"; W_PSK="$(wifi_get psk)"
+  echo "==> Found Wi-Fi '$W_SSID' set up by the Debian installer"
+  apt-get install -y --no-install-recommends wpasupplicant || true
+  moved=0
+  # The hotspot version's Wi-Fi tools need NetworkManager to run the Wi-Fi
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager \
+     && [[ -n "$W_SSID" && "$(wifi_get wep)" != "True" && "$(wifi_get wpa_conf)" != "True" ]]; then
+    nmcli connection delete id "$W_SSID" >/dev/null 2>&1 || true
+    nm_args=(connection add type wifi ifname "$W_IF" con-name "$W_SSID" ssid "$W_SSID" connection.autoconnect yes)
+    [[ -n "$W_PSK" ]] && nm_args+=(wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$W_PSK")
+    if nmcli "${nm_args[@]}" >/dev/null 2>&1; then
+      echo "   $(python3 /opt/kiosk/netcfg.py comment-out)"
+      echo "   Wi-Fi moved to NetworkManager - takes effect after the reboot"
+      echo "   (old file saved as /etc/network/interfaces.kiosk-backup)"
+      moved=1
+    fi
+  fi
+  if [[ "$moved" != 1 ]]; then
+    echo "   $(python3 /opt/kiosk/netcfg.py fix-ifupdown)"
+    echo "   Wi-Fi left on the Debian network file (the settings page Wi-Fi tools won't manage it)"
+  fi
+fi
 
 # ---------- default settings (kept if they already exist) ---------------------
 if [[ ! -f /etc/kiosk/kiosk.conf ]]; then
