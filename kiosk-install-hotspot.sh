@@ -79,6 +79,9 @@ apt-get install -y --no-install-recommends \
   libgl1-mesa-dri libegl1
 
 # Optional helpers (not fatal if missing)
+# polkit helps the display session get access to the screen on some PCs
+apt-get install -y --no-install-recommends polkitd \
+  || apt-get install -y --no-install-recommends policykit-1 || true
 apt-get install -y --no-install-recommends wlopm \
   || echo "   (wlopm not available - screen off will use wlr-randr instead)"
 apt-get install -y --no-install-recommends v4l-utils \
@@ -2531,7 +2534,18 @@ if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
   if [ "$(. /etc/kiosk/kiosk.conf 2>/dev/null; echo "${HIDE_CURSOR:-1}")" = "1" ]; then
     export XCURSOR_THEME=kiosk-hidden
   fi
-  exec labwc > "$HOME/.local/state/kiosk/labwc.log" 2>&1
+  # Wait for the graphics driver - on some PCs the login is faster than it
+  for i in $(seq 1 30); do
+    ls /dev/dri/card* >/dev/null 2>&1 && break
+    sleep 1
+  done
+  sleep 3
+  # Keep retrying instead of logging out, so a slow start never leaves a
+  # black screen (Linux stops auto-login after a few quick failures)
+  while true; do
+    labwc > "$HOME/.local/state/kiosk/labwc.log" 2>&1
+    sleep 5
+  done
 fi
 # <<< kiosk <<<
 EOF
