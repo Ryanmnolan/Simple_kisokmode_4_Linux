@@ -214,6 +214,8 @@ Raspberry Pi 5: there is no headphone jack, so use HDMI or USB speakers. With tw
 Mini PCs: HDMI, DisplayPort, the headphone jack and USB speakers all work.
 If a chosen USB speaker is unplugged, the kiosk falls back to HDMI.
 
+<img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081837_Chrome.jpg" alt="Kiosk screen on and off timer" width="400">
+
 ### Privacy
 
 **Private mode** forgets logins, cookies and history every time the kiosk returns to the home page. Use it for public kiosks where people may log in to things.
