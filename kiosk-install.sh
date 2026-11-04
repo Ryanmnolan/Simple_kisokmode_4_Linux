@@ -15,6 +15,7 @@
 #        - idle timeout: after X minutes with no touches, go back to home page
 #        - screen on/off schedule by time and day of week
 #        - time zone, hide mouse pointer, graphics compatibility mode
+#        - sound: HDMI (default), headphone or USB output, volume, mute, test
 #        - "Go home now", "Screen on/off", "Reboot" and "Shut down" buttons
 #
 #  Debian mini PCs: Wi-Fi set up by the Debian installer is fixed so it
@@ -50,6 +51,7 @@ fi
 
 KIOSK_HOME="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
 KIOSK_GROUP="$(id -gn "$KIOSK_USER")"
+KIOSK_UID="$(id -u "$KIOSK_USER")"
 PAGES_DIR="$KIOSK_HOME/kiosk-pages"
 STATE_DIR="$KIOSK_HOME/.local/state/kiosk"
 
@@ -79,12 +81,21 @@ apt-get install -y --no-install-recommends wlopm \
 apt-get install -y --no-install-recommends v4l-utils \
   || echo "   (v4l-utils not available - HDMI-CEC TV control disabled)"
 
+# Sound: PipeWire runs the speakers (HDMI / headphone / USB) - not fatal if missing
+if apt-get install -y --no-install-recommends pipewire pipewire-pulse wireplumber \
+     pipewire-alsa pulseaudio-utils; then
+  systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service >/dev/null 2>&1 || true
+  loginctl enable-linger "$KIOSK_USER" >/dev/null 2>&1 || true
+else
+  echo "   (sound packages not available - sound settings will be disabled)"
+fi
+
 # Chromium package name differs between releases
 if ! apt-get install -y chromium; then
   apt-get install -y chromium-browser
 fi
 
-for g in video render input; do
+for g in video render input audio; do
   getent group "$g" >/dev/null && usermod -aG "$g" "$KIOSK_USER"
 done
 
@@ -289,6 +300,9 @@ USE_CEC=0
 PRIVATE_MODE=0
 HIDE_CURSOR=1
 SAFE_GRAPHICS=1
+AUDIO_OUTPUT=hdmi
+AUDIO_VOLUME=70
+AUDIO_MUTED=0
 ADMIN_PASSWORD=kiosk
 EOF
 fi
@@ -532,6 +546,8 @@ if [ -z "$CHROME" ]; then
 fi
 
 /usr/local/bin/kiosk-screen &
+# Sound: wait for PipeWire, then set the saved output, volume and mute
+/usr/local/bin/kiosk-audio wait-apply >> "$STATE/session.log" 2>&1 &
 
 fails=0
 while true; do
@@ -715,6 +731,247 @@ while true; do
 done
 EOF
 
+# ---------- kiosk-audio: sound output, volume, mute, test ----------------------
+cat > /usr/local/bin/kiosk-audio <<'AUDEOF'
+#!/usr/bin/env python3
+"""Kiosk sound helper (PipeWire, controlled with pactl).
+
+  kiosk-audio status      -> JSON: outputs, current output, volume, mute
+  kiosk-audio apply       -> use the saved output, volume and mute
+  kiosk-audio wait-apply  -> wait for the sound system at startup, then apply
+  kiosk-audio test        -> play the test sound on the current output
+
+Saved settings (in /etc/kiosk/kiosk.conf):
+  AUDIO_OUTPUT  hdmi | analog | usb | sink:<exact device name>
+  AUDIO_VOLUME  0-100 (set every time the kiosk starts)
+  AUDIO_MUTED   0 | 1
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+CONF = os.environ.get("KIOSK_CONF", "/etc/kiosk/kiosk.conf")
+TEST_WAV = os.environ.get("KIOSK_TEST_WAV", "/opt/kiosk/test-sound.wav")
+STATE = os.path.expanduser("~/.local/state/kiosk")
+DEFAULTS = {"AUDIO_OUTPUT": "hdmi", "AUDIO_VOLUME": "70", "AUDIO_MUTED": "0"}
+os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+
+
+def conf():
+    c = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if "=" not in line or line.startswith("#"):
+                    continue
+                k, v = line.split("=", 1)
+                if k in c:
+                    try:
+                        parts = shlex.split(v)
+                        c[k] = parts[0] if parts else ""
+                    except ValueError:
+                        c[k] = v
+    except OSError:
+        pass
+    return c
+
+
+def pactl(*args, js=False, timeout=10):
+    cmd = ["pactl"] + (["-f", "json"] if js else []) + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise RuntimeError("The sound system is not installed")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("The sound system did not respond")
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        if "onnection" in msg:
+            raise RuntimeError("The sound system is not running yet - try again in a moment")
+        raise RuntimeError(msg.splitlines()[-1] if msg else "Sound command failed")
+    return json.loads(r.stdout or "[]") if js else r.stdout.strip()
+
+
+def kind_of(name, desc):
+    t = (name + " " + desc).lower()
+    if "usb" in t:
+        return "usb"
+    if "hdmi" in t or "displayport" in t:
+        return "hdmi"
+    if "analog" in t or "headphone" in t or "line out" in t or "speaker" in t:
+        return "analog"
+    return "other"
+
+
+def percent(vol):
+    vals = []
+    for ch in (vol or {}).values():
+        m = re.match(r"\s*(\d+)", str(ch.get("value_percent", "")))
+        if m:
+            vals.append(int(m.group(1)))
+    return round(sum(vals) / len(vals)) if vals else None
+
+
+def sinks():
+    out = []
+    for s in pactl("list", "sinks", js=True):
+        name = s.get("name", "")
+        desc = s.get("description") or name
+        avail = True
+        active = s.get("active_port")
+        for p in s.get("ports") or []:
+            if p.get("name") == active and p.get("availability") == "not available":
+                avail = False
+        out.append({"name": name, "description": desc, "kind": kind_of(name, desc),
+                    "available": avail, "volume": percent(s.get("volume")),
+                    "muted": bool(s.get("mute"))})
+    return out
+
+
+def default_sink():
+    try:
+        return pactl("get-default-sink")
+    except RuntimeError:
+        return ""
+
+
+def switch_profile(kind):
+    """PCs often start with only one output active (e.g. analog). Switch the
+    sound card to an HDMI or analog profile so that output exists."""
+    prefix = {"hdmi": "output:hdmi", "analog": "output:analog"}.get(kind)
+    if not prefix:
+        return False
+    best = None
+    for card in pactl("list", "cards", js=True):
+        for pname, p in (card.get("profiles") or {}).items():
+            if not pname.startswith(prefix):
+                continue
+            score = (p.get("available", True) is not False, p.get("priority", 0))
+            if best is None or score > best[0]:
+                best = (score, card.get("name"), pname, card.get("active_profile"))
+    if not best or best[2] == best[3]:
+        return False
+    pactl("set-card-profile", best[1], best[2])
+    time.sleep(1)
+    return True
+
+
+def screen_port_index():
+    """Which HDMI port the screen is on (HDMI-A-1 -> 0), used on the Pi 5,
+    which has one sound output per HDMI port."""
+    try:
+        with open(os.path.join(STATE, "output")) as f:
+            m = re.match(r"HDMI-A-(\d+)", f.read().strip())
+            return int(m.group(1)) - 1 if m else 0
+    except OSError:
+        return 0
+
+
+def choose(output):
+    ss = sinks()
+    if output.startswith("sink:"):
+        if any(s["name"] == output[5:] for s in ss):
+            return output[5:]
+        output = "hdmi"   # that device is gone - fall back to HDMI
+    kind = output if output in ("hdmi", "analog", "usb") else "hdmi"
+    cands = [s for s in ss if s["kind"] == kind]
+    if not cands and switch_profile(kind):
+        cands = [s for s in sinks() if s["kind"] == kind]
+    if not cands:
+        return None
+    ready = [s for s in cands if s["available"]] or cands
+    if kind == "hdmi" and len(ready) > 1:
+        ready.sort(key=lambda s: s["name"])
+        return ready[min(screen_port_index(), len(ready) - 1)]["name"]
+    return ready[0]["name"]
+
+
+def status():
+    try:
+        ss = sinks()
+        return {"available": True, "outputs": ss, "current": default_sink(), "config": conf()}
+    except RuntimeError as e:
+        return {"available": False, "error": str(e), "outputs": [], "current": "", "config": conf()}
+
+
+def apply():
+    c = conf()
+    name = choose(c["AUDIO_OUTPUT"])
+    if name:
+        pactl("set-default-sink", name)
+    try:
+        vol = max(0, min(100, int(c["AUDIO_VOLUME"])))
+    except ValueError:
+        vol = 70
+    pactl("set-sink-volume", "@DEFAULT_SINK@", "%d%%" % vol)
+    pactl("set-sink-mute", "@DEFAULT_SINK@", "1" if c["AUDIO_MUTED"] == "1" else "0")
+    return status()
+
+
+def wait_apply():
+    for _ in range(40):
+        try:
+            if sinks():
+                st = apply()
+                print("Sound: %s at %s%%%s" % (st["current"] or "default",
+                      st["config"]["AUDIO_VOLUME"],
+                      " (muted)" if st["config"]["AUDIO_MUTED"] == "1" else ""))
+                return
+        except RuntimeError:
+            pass
+        time.sleep(1)
+    print("Sound: no sound output found")
+
+
+def test():
+    for cmd in (["paplay", TEST_WAV], ["pw-play", TEST_WAV]):
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"ok": True}
+        except FileNotFoundError:
+            continue
+    raise RuntimeError("No sound player found")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    try:
+        if cmd == "status":
+            print(json.dumps(status()))
+        elif cmd == "apply":
+            print(json.dumps(apply()))
+        elif cmd == "wait-apply":
+            wait_apply()
+        elif cmd == "test":
+            print(json.dumps(test()))
+        else:
+            sys.exit("unknown command")
+    except RuntimeError as e:
+        print(json.dumps({"available": False, "error": str(e)}))
+        sys.exit(1)
+AUDEOF
+chmod 755 /usr/local/bin/kiosk-audio
+
+# Short two-tone test sound for the settings page
+python3 - <<'EOF'
+import math, struct, wave
+rate, frames = 44100, bytearray()
+for freq, dur in ((660, 0.22), (0, 0.06), (880, 0.32)):
+    n = int(rate * dur)
+    for i in range(n):
+        env = min(1.0, i / 800, (n - i) / 800)
+        v = int(0.35 * 32767 * env * math.sin(2 * math.pi * freq * i / rate)) if freq else 0
+        frames += struct.pack("<hh", v, v)
+with wave.open("/opt/kiosk/test-sound.wav", "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate); w.writeframes(bytes(frames))
+EOF
+chmod 644 /opt/kiosk/test-sound.wav
+
 sed -i "s/__PORT__/${ADMIN_PORT}/g" /usr/local/bin/kiosk-session
 chmod 755 /usr/local/bin/kiosk-session /usr/local/bin/kiosk-home /usr/local/bin/kiosk-screen
 
@@ -763,6 +1020,9 @@ DEFAULTS = {
     "PRIVATE_MODE": "0",
     "HIDE_CURSOR": "1",
     "SAFE_GRAPHICS": "1",
+    "AUDIO_OUTPUT": "hdmi",
+    "AUDIO_VOLUME": "70",
+    "AUDIO_MUTED": "0",
     "ADMIN_PASSWORD": "kiosk",
 }
 TIMEZONES = [
@@ -1044,6 +1304,40 @@ def set_timezone(tz):
     time.tzset()
 
 
+# ----------------------------------------------------------------- sound ----
+AUDIO_HELPER = "/usr/local/bin/kiosk-audio"
+
+
+def audio_run(cmd, timeout=25):
+    try:
+        r = subprocess.run([AUDIO_HELPER, cmd], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return {"available": False, "error": "Sound helper missing - re-run the installer"}
+    except subprocess.TimeoutExpired:
+        return {"available": False, "error": "The sound system did not respond"}
+    try:
+        return json.loads(r.stdout or "{}")
+    except ValueError:
+        return {"available": False, "error": (r.stderr or "Sound helper failed").strip()}
+
+
+def audio_set(data):
+    conf = read_conf()
+    out = str(data.get("output", conf["AUDIO_OUTPUT"]))
+    if not (out in ("hdmi", "analog", "usb") or re.fullmatch(r"sink:[A-Za-z0-9_.:@+-]{1,200}", out)):
+        raise ValueError("Unknown sound output")
+    try:
+        vol = int(data.get("volume", conf["AUDIO_VOLUME"]))
+    except (TypeError, ValueError):
+        raise ValueError("Volume must be a number")
+    if not 0 <= vol <= 100:
+        raise ValueError("Volume must be 0-100")
+    muted = "1" if str(data.get("muted", conf["AUDIO_MUTED"])) in ("1", "true", "True") else "0"
+    conf.update(AUDIO_OUTPUT=out, AUDIO_VOLUME=str(vol), AUDIO_MUTED=muted)
+    write_conf(conf)
+    return audio_run("apply")
+
+
 def status():
     override = read_state("override").split()
     time.tzset()
@@ -1212,6 +1506,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/browse":
                 q = urllib.parse.parse_qs(url.query)
                 return self.send_json(browse(q.get("path", [""])[0]))
+            if path == "/api/audio":
+                return self.send_json(audio_run("status"))
             self.send_text("Not found", "text/plain", 404)
         except ValueError as e:
             self.send_json({"error": str(e)}, 400)
@@ -1253,6 +1549,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("Unknown screen state")
                 return self.send_json({"ok": True})
+            if path == "/api/audio":
+                return self.send_json(audio_set(data))
+            if path == "/api/audio/test":
+                return self.send_json(audio_run("test"))
             if path == "/api/reboot":
                 self.send_json({"ok": True})
                 subprocess.Popen(["sudo", "-n", "/usr/sbin/reboot"])
@@ -1301,6 +1601,7 @@ button,.btn{display:inline-block;padding:11px 14px;border-radius:8px;border:1px 
 button:disabled{opacity:.5;cursor:default}
 button.primary{background:var(--acc);border-color:var(--acc);color:var(--accfg);font-weight:600}
 button.danger{color:var(--bad)}
+input[type=range]{width:100%;accent-color:var(--acc);margin:8px 0}
 .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
 .bar{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:12px 16px}
 .bar .in{max-width:680px;margin:0 auto;display:flex;gap:10px}
@@ -1452,6 +1753,19 @@ button.danger{color:var(--bad)}
       <button data-screen="auto">Follow schedule</button>
     </div>
     <div class="hint">Manual on/off lasts until the next scheduled change.</div>
+  </section>
+
+  <section>
+    <h2>Sound</h2>
+    <label class="f" for="aOut">Output</label>
+    <select id="aOut"></select>
+    <label class="f" for="aVol">Volume <b id="aVolTxt"></b></label>
+    <input type="range" id="aVol" min="0" max="100" step="5">
+    <div class="switch"><span>Mute</span><input type="checkbox" id="aMute"></div>
+    <div class="btns"><button id="aTest">Test sound</button><button id="aRefresh">Refresh devices</button></div>
+    <div class="hint" id="aNow">Checking…</div>
+    <div class="hint">Changes apply right away. The kiosk goes back to this volume every time it starts.
+      HDMI sound plays through the screen's own speakers, if it has them.</div>
   </section>
 
   <section>
@@ -1862,7 +2176,69 @@ $('#shutdown').addEventListener('click', async () => {
   } catch (e) { toast(e.message, true); }
 });
 
+/* ---------- sound ---------- */
+const AUDIO_KINDS = {hdmi: 'HDMI (screen speakers)', analog: 'Headphone / speaker jack', usb: 'USB speakers'};
+const AUDIO_CTRLS = ['#aOut', '#aVol', '#aMute', '#aTest'];
+
+function renderAudio(a) {
+  if (!a || !a.available) {
+    $('#aNow').textContent = 'Sound not available: ' + ((a && a.error) || 'unknown error');
+    AUDIO_CTRLS.forEach(s => $(s).disabled = true);
+    return;
+  }
+  AUDIO_CTRLS.forEach(s => $(s).disabled = false);
+  const sel = $('#aOut'); sel.innerHTML = '';
+  const kinds = new Set(a.outputs.map(o => o.kind));
+  Object.entries(AUDIO_KINDS).forEach(([k, label]) => {
+    const o = document.createElement('option');
+    o.value = k; o.textContent = label + (k === 'usb' && !kinds.has('usb') ? ' (none plugged in)' : '');
+    sel.appendChild(o);
+  });
+  if (a.outputs.length) {
+    const g = document.createElement('optgroup'); g.label = 'Specific device';
+    a.outputs.forEach(s => {
+      const o = document.createElement('option');
+      o.value = 'sink:' + s.name; o.textContent = s.description + (s.available ? '' : ' (not connected)');
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
+  }
+  sel.value = a.config.AUDIO_OUTPUT;
+  if (sel.value !== a.config.AUDIO_OUTPUT) sel.value = 'hdmi';
+  $('#aVol').value = a.config.AUDIO_VOLUME;
+  $('#aVolTxt').textContent = a.config.AUDIO_VOLUME + '%';
+  $('#aMute').checked = a.config.AUDIO_MUTED === '1';
+  const cur = a.outputs.find(s => s.name === a.current);
+  $('#aNow').textContent = 'Playing on: ' + (cur ? cur.description : (a.current || 'no output found'));
+}
+
+async function loadAudio() {
+  try { renderAudio(await api('/api/audio')); }
+  catch (e) { renderAudio({available: false, error: e.message}); }
+}
+
+async function saveAudio() {
+  try {
+    renderAudio(await post('/api/audio', {output: $('#aOut').value, volume: $('#aVol').value,
+                                          muted: $('#aMute').checked}));
+    toast('Sound updated');
+  } catch (e) { toast(e.message, true); }
+}
+
+$('#aOut').addEventListener('change', saveAudio);
+$('#aMute').addEventListener('change', saveAudio);
+$('#aVol').addEventListener('input', () => $('#aVolTxt').textContent = $('#aVol').value + '%');
+$('#aVol').addEventListener('change', saveAudio);
+$('#aTest').onclick = async () => {
+  try {
+    const r = await post('/api/audio/test');
+    if (r.available === false) toast(r.error, true); else toast('Playing test sound');
+  } catch (e) { toast(e.message, true); }
+};
+$('#aRefresh').onclick = () => { $('#aNow').textContent = 'Checking…'; loadAudio(); };
+
 load();
+loadAudio();
 setInterval(refreshStatus, 15000);
 </script>
 </body>
@@ -1887,6 +2263,7 @@ After=network.target
 User=${KIOSK_USER}
 Environment=KIOSK_PORT=${ADMIN_PORT}
 Environment=KIOSK_PAGES=${PAGES_DIR}
+Environment=XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}
 ExecStart=/usr/bin/python3 /opt/kiosk/kiosk-admin.py
 Restart=always
 RestartSec=2
