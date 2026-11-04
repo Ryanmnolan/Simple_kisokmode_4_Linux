@@ -197,6 +197,22 @@ The schedule turns off only the **screen**. The computer keeps running, so it is
 
 <img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081837_Chrome.jpg" alt="Kiosk screen on and off timer" width="400">
 
+###Sound
+
+Sound is set up automatically and plays through HDMI by default, meaning the touchscreen's own speakers if it has them. Web pages can play sound and video without a tap first.
+
+Setting	What it does
+Output	HDMI (screen speakers), Headphone / speaker jack or USB speakers. Under Specific device you can pick an exact output if there is more than one.
+Volume	0–100%. The kiosk returns to this volume every time it starts.
+Mute	Silences all sound.
+Test sound	Plays a short two-tone chime on the chosen output.
+Refresh devices	Looks again for outputs, e.g. after plugging in USB speakers.
+
+Changes apply right away; there's no need to tap Save & apply. The line under the buttons shows which device is playing.
+
+Raspberry Pi 5: there is no headphone jack, so use HDMI or USB speakers. With two screens, the sound follows the screen the kiosk uses.
+Mini PCs: HDMI, DisplayPort, the headphone jack and USB speakers all work.
+If a chosen USB speaker is unplugged, the kiosk falls back to HDMI.
 
 ### Privacy
 
