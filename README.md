@@ -197,7 +197,7 @@ The schedule turns off only the **screen**. The computer keeps running, so it is
 
 <img src="https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux/blob/main/images%2FScreenshot_20261005_081837_Chrome.jpg" alt="Kiosk screen on and off timer" width="400">
 
-###Sound
+### Sound
 
 Sound is set up automatically and plays through HDMI by default, meaning the touchscreen's own speakers if it has them. Web pages can play sound and video without a tap first.
 
