@@ -420,15 +420,11 @@ echo "127.0.1.1 $(hostname)" | sudo tee -a /etc/hosts
 ```
 
 ### No sound
-1.On the settings page, check the Sound section. Playing on should name your screen or speakers, and Mute should be off.
-
-2.Tap Test sound. If you hear the chime, the kiosk's sound works and the web page itself is silent or muted.
-
-3.No chime over HDMI: make sure the screen actually has speakers and that its own volume is up (many touchscreen monitors have no speakers). Try Headphone / speaker jack or USB speakers instead.
-
-4."Sound not available": the sound system hasn't started. Reboot, or re-run the installer if the kiosk was installed before sound support was added.
-
-5.To see what the kiosk finds, run this over SSH as the kiosk user:
+1. On the settings page, check the Sound section. Playing on should name your screen or speakers, and Mute should be off.
+2. Tap Test sound. If you hear the chime, the kiosk's sound works and the web page itself is silent or muted.
+3. No chime over HDMI: make sure the screen actually has speakers and that its own volume is up (many touchscreen monitors have no speakers). Try Headphone / speaker jack or USB speakers instead.
+4. "Sound not available": the sound system hasn't started. Reboot, or re-run the installer if the kiosk was installed before sound support was added.
+5. To see what the kiosk finds, run this over SSH as the kiosk user:
 
 ```bash
    kiosk-audio status
