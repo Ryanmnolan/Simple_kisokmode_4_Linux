@@ -104,7 +104,7 @@ scp kiosk-install.sh youruser@kiosk.local:
 Or download it directly on the device:
 ```bash
 git clone https://github.com/Ryanmnolan/Simple_kisokmode_4_Linux.git
-cd Simple_kisokmode_4_Linux.git
+cd Simple_kisokmode_4_Linux
 ```
 
 ### Step 3: Run the installer
