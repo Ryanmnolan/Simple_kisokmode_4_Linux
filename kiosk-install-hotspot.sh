@@ -17,6 +17,7 @@
 #        - screen on/off schedule by time and day of week
 #        - time zone, hide mouse pointer, graphics compatibility mode
 #        - sound: HDMI (default), headphone or USB output, volume, mute, test
+#        - USB drive: browse a USB stick and copy pages from it (read-only)
 #        - Wi-Fi: scan, connect, forget networks
 #
 #        - Network mode: "Use Wi-Fi" or "Offline" (never joins Wi-Fi)
@@ -91,6 +92,9 @@ apt-get install -y --no-install-recommends wlopm \
   || echo "   (wlopm not available - screen off will use wlr-randr instead)"
 apt-get install -y --no-install-recommends v4l-utils \
   || echo "   (v4l-utils not available - HDMI-CEC TV control disabled)"
+
+# USB drives: read NTFS and exFAT sticks too (FAT32 and ext4 work without these)
+apt-get install -y --no-install-recommends ntfs-3g exfatprogs >/dev/null 2>&1 || true
 
 # Sound: PipeWire runs the speakers (HDMI / headphone / USB) - not fatal if missing
 if apt-get install -y --no-install-recommends pipewire pipewire-pulse wireplumber \
@@ -487,10 +491,13 @@ write_rcxml(){
   </core>
   <!-- Kiosk shortcuts. Because these are defined, labwc's default shortcuts
        (close window, app menu, etc.) are not loaded.
-       Ctrl+Alt+S = settings page on this screen, Ctrl+Alt+H = home page,
+       Ctrl+Alt+S (or Shift+Ctrl+S) = settings page on this screen, Ctrl+Alt+H = home page,
        Ctrl+Alt+W = setup hotspot on/off.
        Ctrl+Alt+F2 = text login, Ctrl+Alt+F1 = back to the kiosk. -->
   <keyboard>
+    <keybind key="C-S-s">
+      <action name="Execute" command="/usr/local/bin/kiosk-open-settings"/>
+    </keybind>
     <keybind key="C-A-s">
       <action name="Execute" command="/usr/local/bin/kiosk-open-settings"/>
     </keybind>
@@ -1247,6 +1254,169 @@ if __name__ == "__main__":
 AUDEOF
 chmod 755 /usr/local/bin/kiosk-audio
 
+# ---------- kiosk-usb: read pages from a USB drive (runs as root via sudo) ------
+cat > /usr/local/bin/kiosk-usb <<'USBEOF'
+#!/usr/bin/env python3
+"""Kiosk USB helper - run as root (via sudo) by the settings page.
+
+  kiosk-usb list             -> JSON: USB drives that can be opened
+  kiosk-usb mount /dev/sdb1  -> mount it READ-ONLY at /media/kiosk-usb/sdb1
+  kiosk-usb eject /dev/sdb1  -> unmount it so it is safe to unplug
+  kiosk-usb eject-all        -> unmount every kiosk USB mount
+
+Only removable / USB drives are offered. A disk the system itself runs from
+(for example a Pi booting from a USB SSD) is never listed or mounted.
+"""
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+
+BASE = os.environ.get("KIOSK_USB_BASE", "/media/kiosk-usb")
+KUSER = "__KUSER__"
+FAT_LIKE = {"vfat", "msdos", "exfat", "ntfs", "ntfs3"}
+SUPPORTED = FAT_LIKE | {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs",
+                        "hfsplus", "iso9660", "udf"}
+
+
+def truthy(v):
+    return v in (True, 1, "1", "true")
+
+
+def lsblk():
+    r = subprocess.run(
+        ["lsblk", "-J", "-b", "-o",
+         "NAME,PATH,TYPE,RM,TRAN,SIZE,FSTYPE,LABEL,MOUNTPOINT,MODEL,VENDOR"],
+        capture_output=True, text=True, timeout=15)
+    return json.loads(r.stdout or '{"blockdevices": []}').get("blockdevices", [])
+
+
+def walk(dev):
+    yield dev
+    for c in dev.get("children") or []:
+        yield from walk(c)
+
+
+def drives():
+    out = []
+    for disk in lsblk():
+        if disk.get("type") != "disk":
+            continue
+        if disk.get("tran") != "usb" and not truthy(disk.get("rm")):
+            continue
+        nodes = list(walk(disk))
+        # Skip any disk that is in use by the system (mounted outside our folder)
+        if any(n.get("mountpoint") and not str(n["mountpoint"]).startswith(BASE + "/")
+               for n in nodes):
+            continue
+        parts = [n for n in nodes if n.get("type") == "part"] or [disk]
+        model = " ".join(x for x in ((disk.get("vendor") or "").strip(),
+                                     (disk.get("model") or "").strip()) if x) or "USB drive"
+        for p in parts:
+            fs = (p.get("fstype") or "").lower()
+            if not fs:
+                continue
+            name = os.path.basename(p.get("path") or "")
+            if not re.fullmatch(r"[a-z0-9]{2,20}", name):
+                continue
+            out.append({
+                "dev": p["path"], "name": name, "label": (p.get("label") or "").strip(),
+                "size": int(p.get("size") or 0), "fstype": fs, "model": model,
+                "supported": fs in SUPPORTED,
+                "mounted": os.path.ismount(os.path.join(BASE, name)),
+            })
+    return out
+
+
+def find(dev):
+    for d in drives():
+        if d["dev"] == dev:
+            return d
+    raise RuntimeError("That USB drive was not found - is it still plugged in?")
+
+
+def mount(dev):
+    d = find(dev)
+    if not d["supported"]:
+        raise RuntimeError("This drive's format (%s) can't be read" % d["fstype"])
+    mp = os.path.join(BASE, d["name"])
+    if os.path.ismount(mp):
+        return {"name": d["name"], "mountpoint": mp}
+    os.makedirs(mp, exist_ok=True)
+    opts = "ro,nosuid,nodev,noexec"
+    if d["fstype"] in FAT_LIKE:
+        pw = pwd.getpwnam(KUSER)
+        opts += ",uid=%d,gid=%d,umask=022" % (pw.pw_uid, pw.pw_gid)
+    if d["fstype"] in ("ntfs", "ntfs3"):
+        tries = [["-t", "ntfs3"], ["-t", "ntfs-3g"]]
+    else:
+        tries = [[]]
+    err = ""
+    for t in tries:
+        r = subprocess.run(["mount"] + t + ["-o", opts, dev, mp],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return {"name": d["name"], "mountpoint": mp}
+        err = (r.stderr or r.stdout).strip()
+    try:
+        os.rmdir(mp)
+    except OSError:
+        pass
+    raise RuntimeError("Could not open the USB drive: " + (err.splitlines()[-1] if err else "mount failed"))
+
+
+def unmount(mp):
+    if os.path.ismount(mp):
+        r = subprocess.run(["umount", mp], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            subprocess.run(["umount", "-l", mp], capture_output=True, timeout=30)
+    try:
+        os.rmdir(mp)
+    except OSError:
+        pass
+
+
+def eject(dev):
+    name = os.path.basename(dev)
+    if not re.fullmatch(r"/dev/[a-z0-9]{2,20}", dev):
+        raise RuntimeError("Bad drive name")
+    unmount(os.path.join(BASE, name))
+    subprocess.run(["sync"], timeout=60)
+    return {"ok": True}
+
+
+def eject_all():
+    if os.path.isdir(BASE):
+        for n in os.listdir(BASE):
+            if re.fullmatch(r"[a-z0-9]{2,20}", n):
+                unmount(os.path.join(BASE, n))
+    subprocess.run(["sync"], timeout=60)
+    return {"ok": True}
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    try:
+        if args == ["list"]:
+            res = {"drives": drives()}
+        elif len(args) == 2 and args[0] == "mount":
+            res = mount(args[1])
+        elif len(args) == 2 and args[0] == "eject":
+            res = eject(args[1])
+        elif args == ["eject-all"]:
+            res = eject_all()
+        else:
+            res = {"error": "usage: kiosk-usb list | mount DEV | eject DEV | eject-all"}
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
+        res = {"error": str(e)}
+    print(json.dumps(res))
+USBEOF
+sed -i "s#__KUSER__#${KIOSK_USER}#" /usr/local/bin/kiosk-usb
+chmod 755 /usr/local/bin/kiosk-usb
+install -d -m 755 /media/kiosk-usb
+
 # Short two-tone test sound for the settings page
 python3 - <<'EOF'
 import math, struct, wave
@@ -1882,6 +2052,139 @@ def status():
     }
 
 
+# ------------------------------------------------------------------- usb ----
+USB_HELPER = os.environ.get("KIOSK_USB_HELPER", "/usr/local/bin/kiosk-usb")
+USB_BASE = os.environ.get("KIOSK_USB_BASE", "/media/kiosk-usb")
+MAX_USB_COPY = 8 * 1024 ** 3
+USB_SKIP = SKIP_NAMES | {"System Volume Information", "$RECYCLE.BIN", "RECYCLER", "lost+found"}
+
+
+def usb_run(*args, timeout=60):
+    cmd = ([USB_HELPER] if os.geteuid() == 0 else ["sudo", "-n", USB_HELPER]) + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise ValueError("USB helper missing - re-run the installer")
+    except subprocess.TimeoutExpired:
+        raise ValueError("The USB drive did not respond")
+    try:
+        d = json.loads(r.stdout or "{}")
+    except ValueError:
+        raise ValueError((r.stderr or "USB helper failed").strip()[-200:])
+    if d.get("error"):
+        raise ValueError(d["error"])
+    return d
+
+
+def usb_dev(dev):
+    dev = str(dev or "")
+    if not re.fullmatch(r"/dev/[a-z0-9]{2,20}", dev):
+        raise ValueError("Bad drive name")
+    return dev
+
+
+def usb_root(name):
+    if not re.fullmatch(r"[a-z0-9]{2,20}", str(name or "")):
+        raise ValueError("Bad drive name")
+    root = os.path.join(USB_BASE, name)
+    if not os.path.ismount(root) and not os.environ.get("KIOSK_USB_TEST"):
+        raise ValueError("That USB drive is not open - tap Check for USB")
+    return root
+
+
+def usb_skip(dirpath, n):
+    return n.startswith(".") or n in USB_SKIP or os.path.islink(os.path.join(dirpath, n))
+
+
+def usb_browse(name, rel):
+    root = usb_root(name)
+    rel = clean_rel(rel)
+    full = safe_join(root, rel)
+    if not os.path.isdir(full):
+        raise ValueError("Folder not found")
+    entries = []
+    for n in os.listdir(full):
+        if usb_skip(full, n):
+            continue
+        child = f"{rel}/{n}" if rel else n
+        try:
+            clean_rel(child)
+        except ValueError:
+            continue
+        p = os.path.join(full, n)
+        if os.path.isdir(p):
+            try:
+                count = len([x for x in os.listdir(p) if not usb_skip(p, x)])
+            except OSError:
+                count = 0
+            entries.append({"name": n, "path": child, "type": "dir",
+                            "index": find_index(p), "count": count})
+        elif os.path.isfile(p):
+            entries.append({"name": n, "path": child, "type": "file",
+                            "size": os.path.getsize(p), "page": is_page(n)})
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    return {"name": name, "path": rel, "entries": entries}
+
+
+def tree_size(p):
+    if os.path.isfile(p):
+        return os.path.getsize(p)
+    total = 0
+    for dp, ds, fs in os.walk(p):
+        ds[:] = [d for d in ds if not usb_skip(dp, d)]
+        total += sum(os.path.getsize(os.path.join(dp, f)) for f in fs if not usb_skip(dp, f))
+    return total
+
+
+def usb_copy(data):
+    root = usb_root(data.get("drive"))
+    src_rel = clean_rel(str(data.get("path", "")))
+    src = safe_join(root, src_rel)
+    if not os.path.exists(src):
+        raise ValueError("Not found on the USB drive")
+    dest = clean_rel(str(data.get("dest", "")))
+    if dest.split("/", 1)[0] in PROTECTED:
+        dest = ""
+    if src_rel:
+        base = os.path.basename(src_rel)
+    else:   # the whole drive: name the folder after the drive label
+        base = re.sub(r"[^A-Za-z0-9._ ()-]", "_", str(data.get("label") or "")).strip(" ._") or "usb-drive"
+    target_rel = clean_rel(f"{dest}/{base}" if dest else base, allow_root=False)
+    if target_rel.split("/", 1)[0] in PROTECTED:
+        raise ValueError("Pick a different folder - that name is built in")
+    target = safe_join(PAGES, target_rel)
+    size = tree_size(src)
+    if size > MAX_USB_COPY:
+        raise ValueError("That is too much to copy at once (over 8 GB)")
+    if size > shutil.disk_usage(PAGES).free - 200 * 1024 * 1024:
+        raise ValueError("Not enough free space on the kiosk")
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, "." + os.path.basename(target) + ".copying")
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp)
+    elif os.path.exists(tmp):
+        os.remove(tmp)
+    if os.path.isdir(src):
+        shutil.copytree(src, tmp, copy_function=shutil.copyfile,
+                        ignore=lambda d, names: [n for n in names if usb_skip(d, n)])
+    else:
+        shutil.copyfile(src, tmp)
+    if os.path.isdir(target):
+        shutil.rmtree(target)
+    elif os.path.exists(target):
+        os.remove(target)
+    os.replace(tmp, target)
+    index = None
+    if os.path.isdir(target):
+        idx = find_index(target)
+        if idx:
+            index = f"{target_rel}/{idx}"
+    elif is_page(base):
+        index = target_rel
+    return {"ok": True, "path": target_rel, "index": index, "size": size}
+
+
 def kiosk_home():
     try:
         subprocess.Popen(["/usr/local/bin/kiosk-home", "--force"],
@@ -2039,6 +2342,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(browse(q.get("path", [""])[0]))
             if path == "/api/audio":
                 return self.send_json(audio_run("status"))
+            if path == "/api/usb":
+                return self.send_json(usb_run("list"))
+            if path == "/api/usb/browse":
+                q = urllib.parse.parse_qs(url.query)
+                return self.send_json(usb_browse(q.get("drive", [""])[0], q.get("path", [""])[0]))
             if path == "/api/wifi":
                 q = urllib.parse.parse_qs(url.query)
                 return self.send_json(wifi_status(q.get("rescan", ["0"])[0] == "1"))
@@ -2094,6 +2402,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if path == "/api/audio":
                 return self.send_json(audio_set(data))
+            if path == "/api/usb/open":
+                return self.send_json(usb_run("mount", usb_dev(data.get("dev"))))
+            if path == "/api/usb/copy":
+                return self.send_json(usb_copy(data))
+            if path == "/api/usb/eject":
+                return self.send_json(usb_run("eject", usb_dev(data.get("dev"))))
             if path == "/api/audio/test":
                 return self.send_json(audio_run("test"))
             if path == "/api/reboot":
@@ -2212,6 +2526,8 @@ button,.btn{display:inline-block;padding:11px 14px;border-radius:8px;border:1px 
 button:disabled{opacity:.5;cursor:default}
 button.primary{background:var(--acc);border-color:var(--acc);color:var(--accfg);font-weight:600}
 button.danger{color:var(--bad)}
+.usbbox{margin-top:14px}
+.usbbox .ttl{font-weight:600;font-size:14px;padding:4px 6px}
 input[type=range]{width:100%;accent-color:var(--acc);margin:8px 0}
 button.small{padding:6px 10px;font-size:13px}
 h3{font-size:15px;margin:20px 0 6px}
@@ -2304,6 +2620,22 @@ h3{font-size:15px;margin:20px 0 6px}
         <b>Upload folder</b> copies a whole site folder (works on computers; phones can use Upload files).
         A .zip is unpacked into its own folder. Files with the same name are replaced.
         You can also drag files onto the list.</div>
+
+      <div class="fb usbbox" id="usbBox">
+        <div class="fb-head">
+          <div class="crumbs" id="usbCrumbs"><span class="ttl">USB drive</span></div>
+          <button class="small" id="usbScan">Check for USB</button>
+        </div>
+        <div class="fb-list" id="usbList"><div class="empty">Plug a USB drive into the kiosk, then tap Check for USB.</div></div>
+        <div class="fb-foot hidden" id="usbFoot">
+          <button id="usbAll">Copy this whole folder</button>
+          <button class="danger" id="usbEject">Eject</button>
+          <span class="where" id="usbWhere"></span>
+        </div>
+      </div>
+      <div class="hint">The USB drive is only read, never changed. <b>Copy</b> puts a file or folder on the kiosk,
+        in the folder you have open above. <b>Use</b> copies a page together with the rest of its folder
+        (images, CSS) and makes it the home page. Tap <b>Eject</b> before unplugging.</div>
     </div>
   </section>
 
@@ -2945,6 +3277,140 @@ $('#shutdown').addEventListener('click', async () => {
   } catch (e) { toast(e.message, true); }
 });
 
+/* ---------- USB drive ---------- */
+const ICON_USB = '<svg viewBox="0 0 24 24" fill="none"><rect x="7" y="9" width="10" height="13" rx="2" fill="#8b94a1" opacity=".25" stroke="#8b94a1" stroke-width="1.5"/><path d="M9 9V3h6v6" stroke="#8b94a1" stroke-width="1.5"/></svg>';
+let usb = {drive: null, dev: '', label: '', cwd: '', entries: []};
+
+function fmtBig(n) { return n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1e6)) + ' MB'; }
+function usbDest() { return isProtected(cwd) ? '' : cwd; }
+
+function usbMessage(text) {
+  const list = $('#usbList'); list.innerHTML = '';
+  const e = document.createElement('div'); e.className = 'empty'; e.textContent = text;
+  list.appendChild(e);
+}
+
+function renderUsbHead() {
+  const c = $('#usbCrumbs'); c.innerHTML = '';
+  if (!usb.drive) {
+    c.innerHTML = '<span class="ttl">USB drive</span>';
+    $('#usbFoot').classList.add('hidden');
+    return;
+  }
+  const add = (label, path) => {
+    const b = document.createElement('button');
+    b.textContent = label; b.onclick = () => usbBrowse(path); c.appendChild(b);
+  };
+  add(usb.label, '');
+  const parts = usb.cwd ? usb.cwd.split('/') : [];
+  parts.forEach((p, i) => {
+    const s = document.createElement('span'); s.textContent = '›'; c.appendChild(s);
+    add(p, parts.slice(0, i + 1).join('/'));
+  });
+  $('#usbFoot').classList.remove('hidden');
+  $('#usbWhere').textContent = 'Copies go to: /' + usbDest();
+}
+
+async function usbScan() {
+  usb.drive = null; renderUsbHead(); usbMessage('Checking…');
+  try {
+    const r = await api('/api/usb');
+    if (!r.drives.length) { usbMessage('No USB drive found. Plug one into the kiosk and tap Check for USB.'); return; }
+    const list = $('#usbList'); list.innerHTML = '';
+    r.drives.forEach(d => {
+      const row = document.createElement('div'); row.className = 'item dir';
+      row.innerHTML = ICON_USB;
+      const nm = document.createElement('div'); nm.className = 'nm';
+      nm.textContent = d.label || d.model;
+      const sm = document.createElement('small');
+      sm.textContent = [d.label ? d.model : '', fmtBig(d.size), d.fstype.toUpperCase()].filter(Boolean).join(' · ') +
+                       (d.supported ? '' : ' · format not readable');
+      nm.appendChild(sm);
+      const acts = document.createElement('div'); acts.className = 'acts';
+      if (d.supported) {
+        nm.onclick = () => usbOpen(d);
+        acts.appendChild(actionBtn('Open', 'use', () => usbOpen(d)));
+      }
+      row.append(nm, acts); list.appendChild(row);
+    });
+  } catch (e) { usbMessage(e.message); }
+}
+
+async function usbOpen(d) {
+  usbMessage('Opening…');
+  try {
+    const r = await post('/api/usb/open', {dev: d.dev});
+    usb.drive = r.name; usb.dev = d.dev; usb.label = d.label || d.model;
+    usbBrowse('');
+  } catch (e) { toast(e.message, true); usbScan(); }
+}
+
+async function usbBrowse(path) {
+  try {
+    const r = await api('/api/usb/browse?drive=' + encodeURIComponent(usb.drive) + '&path=' + encodeURIComponent(path));
+    usb.cwd = r.path; usb.entries = r.entries; renderUsb();
+  } catch (e) { toast(e.message, true); usbScan(); }
+}
+
+function renderUsb() {
+  renderUsbHead();
+  const list = $('#usbList'); list.innerHTML = '';
+  if (usb.cwd) {
+    const up = document.createElement('div'); up.className = 'item dir'; up.innerHTML = ICON_DIR;
+    const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = '.. (back)';
+    const p = usb.cwd.includes('/') ? usb.cwd.slice(0, usb.cwd.lastIndexOf('/')) : '';
+    nm.onclick = () => usbBrowse(p);
+    up.appendChild(nm); list.appendChild(up);
+  }
+  if (!usb.entries.length) {
+    const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'This folder is empty.';
+    list.appendChild(e); return;
+  }
+  usb.entries.forEach(it => {
+    const row = document.createElement('div'); row.className = 'item ' + it.type;
+    row.innerHTML = it.type === 'dir' ? ICON_DIR : (it.page ? ICON_PAGE : ICON_FILE);
+    const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = it.name;
+    const sm = document.createElement('small');
+    const acts = document.createElement('div'); acts.className = 'acts';
+    if (it.type === 'dir') {
+      sm.textContent = it.count + ' item' + (it.count === 1 ? '' : 's') + (it.index ? ' · has ' + it.index : '');
+      nm.onclick = () => usbBrowse(it.path);
+      acts.appendChild(actionBtn('Copy', '', () => usbCopy(it.path)));
+    } else {
+      sm.textContent = fmtSize(it.size);
+      if (it.page && usb.cwd) acts.appendChild(actionBtn('Use', 'use', () => usbCopy(usb.cwd, it.name)));
+      acts.appendChild(actionBtn('Copy', '', () => usbCopy(it.path)));
+    }
+    nm.appendChild(sm); row.append(nm, acts); list.appendChild(row);
+  });
+}
+
+async function usbCopy(path, pageInside) {
+  if (busy) return;
+  const dest = usbDest();
+  setBusy(true);
+  $('#prog').textContent = 'Copying from the USB drive… large folders can take a minute.';
+  try {
+    const r = await post('/api/usb/copy', {drive: usb.drive, path, dest, label: usb.label});
+    $('#prog').textContent = 'Copied to /' + r.path + ' (' + fmtSize(r.size) + ').';
+    const pick = pageInside ? r.path + '/' + pageInside : r.index;
+    if (pick) { select(pick); toast('Copied - tap Save & apply to show it'); }
+    else toast('Copied to the kiosk');
+    await openDir(dest);
+  } catch (e) { $('#prog').textContent = ''; toast(e.message, true); }
+  setBusy(false);
+}
+
+$('#usbScan').onclick = usbScan;
+$('#usbAll').onclick = () => {
+  if (confirm('Copy everything in "' + (usb.cwd || usb.label) + '" to the kiosk?')) usbCopy(usb.cwd);
+};
+$('#usbEject').onclick = async () => {
+  try { await post('/api/usb/eject', {dev: usb.dev}); toast('Safe to unplug the USB drive'); }
+  catch (e) { toast(e.message, true); }
+  usb.drive = null; renderUsbHead(); usbMessage('Ejected. Plug in a USB drive and tap Check for USB.');
+};
+
 /* ---------- sound ---------- */
 const AUDIO_KINDS = {hdmi: 'HDMI (screen speakers)', analog: 'Headphone / speaker jack', usb: 'USB speakers'};
 const AUDIO_CTRLS = ['#aOut', '#aVol', '#aMute', '#aTest'];
@@ -3043,7 +3509,7 @@ EOF
 
 # Allow the settings page's Reboot / Shut down buttons, time zone and Wi-Fi tools
 cat > /etc/sudoers.d/kiosk <<EOF
-${KIOSK_USER} ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/sbin/poweroff, /usr/bin/timedatectl set-timezone *, /usr/bin/nmcli
+${KIOSK_USER} ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/sbin/poweroff, /usr/bin/timedatectl set-timezone *, /usr/local/bin/kiosk-usb, /usr/bin/nmcli
 EOF
 chmod 440 /etc/sudoers.d/kiosk
 visudo -cf /etc/sudoers.d/kiosk >/dev/null
@@ -3058,6 +3524,9 @@ if [[ ! -f "$KIOSK_HOME/.config/labwc/rc.xml" ]]; then
 <?xml version="1.0"?>
 <labwc_config>
   <keyboard>
+    <keybind key="C-S-s">
+      <action name="Execute" command="/usr/local/bin/kiosk-open-settings"/>
+    </keybind>
     <keybind key="C-A-s">
       <action name="Execute" command="/usr/local/bin/kiosk-open-settings"/>
     </keybind>
